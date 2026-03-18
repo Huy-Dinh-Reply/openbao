@@ -26,7 +26,7 @@ jobs:
         id: scanoss-code-scan-step
         uses: scanoss/code-scan-action@v1
         with:
-          policies: copyleft, undeclared, dt
+          policies: undeclared
           scanMode: 'delta'
           dependencies.enabled: true
           
