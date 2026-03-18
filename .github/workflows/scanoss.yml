@@ -1,0 +1,37 @@
+name: Full Example Workflow with SCANOSS
+
+on:
+  pull_request:
+    branches:
+      - '*'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: write
+  actions: read
+
+jobs:
+   scanoss-code-scan:
+    name: SCANOSS Code Scan
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run SCANOSS Code Scan
+        id: scanoss-code-scan-step
+        uses: scanoss/code-scan-action@v1
+        with:
+          policies: copyleft, undeclared, dt
+          scanMode: 'delta'
+          dependencies.enabled: true
+          
+      - name: Print stdout scan command
+        run: echo "${{ steps.scanoss-code-scan-step.outputs.stdout-scan-command }}"
+
+      - name: Print Results
+        run: cat "${{ steps.scanoss-code-scan-step.outputs.result-filepath }}"
