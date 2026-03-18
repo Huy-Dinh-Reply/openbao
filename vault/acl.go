@@ -5,23 +5,18 @@ package vault
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
-	"slices"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/armon/go-radix"
 	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
+	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/mitchellh/copystructure"
-	"github.com/openbao/openbao/helper/identity"
-	"github.com/openbao/openbao/helper/namespace"
-	"github.com/openbao/openbao/sdk/v2/logical"
 )
 
 // ACL is used to wrap a set of policies to provide
@@ -35,8 +30,11 @@ type ACL struct {
 
 	segmentWildcardPaths map[string]interface{}
 
-	// root property is a non-nil namespace if the "root" named policy (and only "root") is present.
-	root *namespace.Namespace
+	// root is enabled if the "root" named policy is present.
+	root bool
+
+	// Stores policies that are actually RGPs for later fetching
+	rgpPolicies []*Policy
 }
 
 type PolicyCheckOpts struct {
@@ -54,20 +52,18 @@ type AuthResults struct {
 }
 
 type ACLResults struct {
-	Allowed                bool
-	RootPrivs              bool
-	IsRoot                 bool
-	MFAMethods             []string
-	CapabilitiesBitmap     uint32
-	GrantingPolicies       []logical.PolicyInfo
-	ResponseKeysFilterPath string
+	Allowed            bool
+	RootPrivs          bool
+	IsRoot             bool
+	MFAMethods         []string
+	ControlGroup       *ControlGroup
+	CapabilitiesBitmap uint32
+	GrantingPolicies   []logical.PolicyInfo
 }
 
 type SentinelResults struct {
 	GrantingPolicies []logical.PolicyInfo
 }
-
-const limitParameterName = "limit"
 
 // NewACL is used to construct a policy based ACL from a set of policies.
 func NewACL(ctx context.Context, policies []*Policy) (*ACL, error) {
@@ -76,6 +72,7 @@ func NewACL(ctx context.Context, policies []*Policy) (*ACL, error) {
 		exactRules:           radix.New(),
 		prefixRules:          radix.New(),
 		segmentWildcardPaths: make(map[string]interface{}, len(policies)),
+		root:                 false,
 	}
 
 	ns, err := namespace.FromContext(ctx)
@@ -95,28 +92,29 @@ func NewACL(ctx context.Context, policies []*Policy) (*ACL, error) {
 
 		switch policy.Type {
 		case PolicyTypeACL:
+		case PolicyTypeRGP:
+			a.rgpPolicies = append(a.rgpPolicies, policy)
+			continue
 		default:
-			return nil, errors.New("unable to parse policy (wrong type)")
+			return nil, fmt.Errorf("unable to parse policy (wrong type)")
 		}
 
 		// Check if this is root
 		if policy.Name == "root" {
-			if len(policies) != 1 {
-				return nil, errors.New("other policies present along with root")
+			if ns.ID != namespace.RootNamespaceID {
+				return nil, fmt.Errorf("root policy is only allowed in root namespace")
 			}
-			// if it is root, inject the namespace from context to the ACL
-			a.root = ns
+
+			if len(policies) != 1 {
+				return nil, fmt.Errorf("other policies present along with root")
+			}
+			a.root = true
 		}
 
 		for _, pc := range policy.Paths {
 			var raw interface{}
 			var ok bool
 			var tree *radix.Tree
-
-			if !pc.Expiration.IsZero() && time.Now().After(pc.Expiration) {
-				// Skip adding expired paths.
-				continue
-			}
 
 			switch {
 			case pc.HasSegmentWildcards:
@@ -244,7 +242,7 @@ func NewACL(ctx context.Context, policies []*Policy) (*ACL, error) {
 					existingPerms.RequiredParameters = pc.Permissions.RequiredParameters
 				} else {
 					for _, v := range pc.Permissions.RequiredParameters {
-						if !slices.Contains(existingPerms.RequiredParameters, v) {
+						if !strutil.StrListContains(existingPerms.RequiredParameters, v) {
 							existingPerms.RequiredParameters = append(existingPerms.RequiredParameters, v)
 						}
 					}
@@ -260,19 +258,20 @@ func NewACL(ctx context.Context, policies []*Policy) (*ACL, error) {
 				existingPerms.MFAMethods = strutil.RemoveDuplicates(existingPerms.MFAMethods, false)
 			}
 
-			// Lowest set pagination limit wins.
-			if pc.Permissions.PaginationLimit > 0 {
-				if existingPerms.PaginationLimit <= 0 || pc.Permissions.PaginationLimit < existingPerms.PaginationLimit {
-					existingPerms.PaginationLimit = pc.Permissions.PaginationLimit
+			// No need to dedupe this list since any authorization can satisfy any factor, so long as
+			// the factor matches the specified permission requested.
+			if pc.Permissions.ControlGroup != nil {
+				if len(pc.Permissions.ControlGroup.Factors) > 0 {
+					if existingPerms.ControlGroup == nil {
+						cg, err := pc.Permissions.ControlGroup.Clone()
+						if err != nil {
+							return nil, err
+						}
+						existingPerms.ControlGroup = cg
+					} else {
+						existingPerms.ControlGroup.Factors = append(existingPerms.ControlGroup.Factors, pc.Permissions.ControlGroup.Factors...)
+					}
 				}
-			}
-
-			// If we do not have a ResponseKeysFilterPath value, update our
-			// existing permissions to contain it. This means that the first
-			// policy which contains non-empty
-			// list_scan_response_keys_filter_path value wins.
-			if len(pc.Permissions.ResponseKeysFilterPath) > 0 && len(existingPerms.ResponseKeysFilterPath) == 0 {
-				existingPerms.ResponseKeysFilterPath = pc.Permissions.ResponseKeysFilterPath
 			}
 
 		INSERT:
@@ -323,54 +322,46 @@ func (a *ACL) Capabilities(ctx context.Context, path string) (pathCapabilities [
 	if capabilities&PatchCapabilityInt > 0 {
 		pathCapabilities = append(pathCapabilities, PatchCapability)
 	}
-	if capabilities&ScanCapabilityInt > 0 {
-		pathCapabilities = append(pathCapabilities, ScanCapability)
-	}
 
 	// If "deny" is explicitly set or if the path has no capabilities at all,
 	// set the path capabilities to "deny"
 	if capabilities&DenyCapabilityInt > 0 || len(pathCapabilities) == 0 {
 		pathCapabilities = []string{DenyCapability}
 	}
-	return pathCapabilities
+	return
 }
 
 // AllowOperation is used to check if the given operation is permitted.
 func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheckOnly bool) (ret *ACLResults) {
 	ret = new(ACLResults)
 
-	ns, err := namespace.FromContext(ctx)
-	if err != nil {
-		return ret
-	}
-
-	// a.root is not nil if the policy attached is a 'root' policy;
-	// if it's present, we are checking whether namespace embedded in the acl
-	// is a parent (ancestor) of the namespace of the current request, if so
-	// then allow the request (fast-pathing as root), otherwise reject
-	if a.root != nil {
-		if !ns.HasParent(a.root) {
-			return ret
-		}
+	// Fast-path root
+	if a.root {
 		ret.Allowed = true
 		ret.RootPrivs = true
 		ret.IsRoot = true
 		ret.GrantingPolicies = []logical.PolicyInfo{{
 			Name:          "root",
-			NamespaceId:   a.root.ID,
-			NamespacePath: a.root.Path,
+			NamespaceId:   "root",
+			NamespacePath: "",
 			Type:          "acl",
 		}}
-		return ret
+		return
 	}
 	op := req.Operation
 
 	// Help is always allowed
 	if op == logical.HelpOperation {
 		ret.Allowed = true
-		return ret
+		return
 	}
 
+	var permissions *ACLPermissions
+
+	ns, err := namespace.FromContext(ctx)
+	if err != nil {
+		return
+	}
 	path := ns.Path + req.Path
 
 	// The request path should take care of this already but this is useful for
@@ -383,7 +374,6 @@ func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheck
 		}
 	}
 
-	var permissions *ACLPermissions
 	// Find an exact matching rule, look for prefix if no match
 	var capabilities uint32
 	raw, ok := a.exactRules.Get(path)
@@ -392,7 +382,7 @@ func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheck
 		capabilities = permissions.CapabilitiesBitmap
 		goto CHECK
 	}
-	if op == logical.ListOperation || op == logical.ScanOperation {
+	if op == logical.ListOperation {
 		raw, ok = a.exactRules.Get(strings.TrimSuffix(path, "/"))
 		if ok {
 			permissions = raw.(*ACLPermissions)
@@ -401,9 +391,9 @@ func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheck
 		}
 	}
 
-	// List and Scan operations need to check without the trailing slash first,
-	// because there could be other rules with trailing wildcards that will
-	// match the path.
+	// List operations need to check without the trailing slash first, because
+	// there could be other rules with trailing wildcards that will match the
+	// path
 	if op == logical.ListOperation && strings.HasSuffix(path, "/") {
 		permissions = a.CheckAllowedFromNonExactPaths(strings.TrimSuffix(path, "/"), false)
 		if permissions != nil {
@@ -419,7 +409,7 @@ func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheck
 
 	// No exact, prefix, or segment wildcard paths found, return without
 	// setting allowed
-	return ret
+	return
 
 CHECK:
 	// Check if the minimum permissions are met
@@ -435,6 +425,7 @@ CHECK:
 	}
 
 	ret.MFAMethods = permissions.MFAMethods
+	ret.ControlGroup = permissions.ControlGroup
 
 	var grantingPolicies []logical.PolicyInfo
 	operationAllowed := false
@@ -457,9 +448,6 @@ CHECK:
 	case logical.PatchOperation:
 		operationAllowed = capabilities&PatchCapabilityInt > 0
 		grantingPolicies = permissions.GrantingPoliciesMap[PatchCapabilityInt]
-	case logical.ScanOperation:
-		operationAllowed = capabilities&ScanCapabilityInt > 0
-		grantingPolicies = permissions.GrantingPoliciesMap[ScanCapabilityInt]
 
 	// These three re-use UpdateCapabilityInt since that's the most appropriate
 	// capability/operation mapping
@@ -468,23 +456,23 @@ CHECK:
 		grantingPolicies = permissions.GrantingPoliciesMap[UpdateCapabilityInt]
 
 	default:
-		return ret
+		return
 	}
 
 	if !operationAllowed {
-		return ret
+		return
 	}
 
 	ret.GrantingPolicies = grantingPolicies
 
 	if permissions.MaxWrappingTTL > 0 {
 		if req.WrapInfo == nil || req.WrapInfo.TTL > permissions.MaxWrappingTTL {
-			return ret
+			return
 		}
 	}
 	if permissions.MinWrappingTTL > 0 {
 		if req.WrapInfo == nil || req.WrapInfo.TTL < permissions.MinWrappingTTL {
-			return ret
+			return
 		}
 	}
 	// This situation can happen because of merging, even though in a single
@@ -492,7 +480,7 @@ CHECK:
 	if permissions.MinWrappingTTL != 0 &&
 		permissions.MaxWrappingTTL != 0 &&
 		permissions.MaxWrappingTTL < permissions.MinWrappingTTL {
-		return ret
+		return
 	}
 
 	// Only check parameter permissions for operations that can modify
@@ -500,14 +488,14 @@ CHECK:
 	if op == logical.ReadOperation || op == logical.UpdateOperation || op == logical.CreateOperation || op == logical.PatchOperation {
 		for _, parameter := range permissions.RequiredParameters {
 			if _, ok := req.Data[strings.ToLower(parameter)]; !ok {
-				return ret
+				return
 			}
 		}
 
 		// If there are no data fields, allow
 		if len(req.Data) == 0 {
 			ret.Allowed = true
-			return ret
+			return
 		}
 
 		if len(permissions.DeniedParameters) == 0 {
@@ -516,7 +504,7 @@ CHECK:
 
 		// Check if all parameters have been denied
 		if _, ok := permissions.DeniedParameters["*"]; ok {
-			return ret
+			return
 		}
 
 		for parameter, value := range req.Data {
@@ -524,7 +512,7 @@ CHECK:
 			if valueSlice, ok := permissions.DeniedParameters[strings.ToLower(parameter)]; ok {
 				// If the value exists in denied values slice, deny
 				if valueInParameterList(value, valueSlice) {
-					return ret
+					return
 				}
 			}
 		}
@@ -533,121 +521,32 @@ CHECK:
 		// If we don't have any allowed parameters set, allow
 		if len(permissions.AllowedParameters) == 0 {
 			ret.Allowed = true
-			return ret
+			return
 		}
 
 		_, allowedAll := permissions.AllowedParameters["*"]
 		if len(permissions.AllowedParameters) == 1 && allowedAll {
 			ret.Allowed = true
-			return ret
+			return
 		}
 
 		for parameter, value := range req.Data {
 			valueSlice, ok := permissions.AllowedParameters[strings.ToLower(parameter)]
 			// Requested parameter is not in allowed list
 			if !ok && !allowedAll {
-				return ret
+				return
 			}
 
 			// If the value doesn't exists in the allowed values slice,
 			// deny
 			if ok && !valueInParameterList(value, valueSlice) {
-				return ret
+				return
 			}
 		}
-	} else if op == logical.ListOperation || op == logical.ScanOperation {
-		if permissions.PaginationLimit > 0 {
-			valRaw, ok := req.Data[limitParameterName]
-			if !ok {
-				// For callers unaware of pagination, deny the request IF
-				// limit is a required parameter; this prevents integrations
-				// from silently continuing to work if they were not expecting
-				// to have pagination while also allowing them to continue
-				// working if the operator just wishes to enable pagination
-				// for them without breakage.
-
-				limitRequiredParameter := false
-				for _, parameter := range permissions.RequiredParameters {
-					if strings.ToLower(parameter) == limitParameterName {
-						limitRequiredParameter = true
-						break
-					}
-				}
-
-				if limitRequiredParameter {
-					return ret
-				}
-
-				// Otherwise, update our field value to the maximum allowed.
-				if req.Data == nil {
-					// A list operation may have no parameters so we need to
-					// populate this explicitly.
-					req.Data = make(map[string]interface{}, 1)
-				}
-				req.Data[limitParameterName] = strconv.Itoa(permissions.PaginationLimit)
-			} else {
-				// Value was provided on the API request and we have a
-				// non-zero limit so we know it was intended to be a limit
-				// operation on a paginated endpoint. Parse the value and
-				// ACL accordingly.
-				val, err := parseutil.SafeParseInt(valRaw)
-				if err != nil {
-					// Unable to parse provided limit as an integer; we assume
-					// the policy author is correct that this is a regular list
-					// endpoint which (optionally) takes a limit. The one
-					// exception is if the user has passed the literal value
-					// "max" to signify the maximum allowed page size, which
-					// works even if the parameter is required (versus leaving
-					// it off).
-					valStr, ok := valRaw.(string)
-					if !ok || valStr != "max" {
-						// Request denied.
-						return ret
-					}
-
-					// Otherwise, update our field value to the maximum allowed.
-					req.Data[limitParameterName] = strconv.Itoa(permissions.PaginationLimit)
-				} else {
-					// Deny if we exceed our allotted page size.
-					if val > permissions.PaginationLimit {
-						return ret
-					}
-				}
-			}
-		} else {
-			// Check if we have the value `max` and set it to 0. This allows
-			// pagination-aware applications to read all data via the same
-			// semantics, without knowing ahead of time whether they are
-			// pagination-limited on a given endpoint: they can call with
-			// after=""&limit=max and then retry with after=<last>&limit=max
-			// and see if any results are returned, repeating until none are.
-
-			valRaw, ok := req.Data[limitParameterName]
-			if ok {
-				// Failure to parse should be ignored in this case. The
-				// operator has not indicated to us that this value of
-				// limit should be an integer limit and it may be some
-				// custom plugin with alternative behavior.
-				valStr, ok := valRaw.(string)
-				if ok && valStr == "max" {
-					// Application has indicated they're aware of the value
-					// of limit and so we should set the limit to zero
-					// (maximum).
-					req.Data[limitParameterName] = "0"
-				}
-			}
-		}
-	}
-
-	// Return the ResponseKeysFilterPath value from this permission: it
-	// will allow filterListResponse to evaluate list filtering without
-	// having knowledge of concrete policies.
-	if op == logical.ListOperation || op == logical.ScanOperation {
-		ret.ResponseKeysFilterPath = permissions.ResponseKeysFilterPath
 	}
 
 	ret.Allowed = true
-	return ret
+	return
 }
 
 type wcPathDescr struct {
@@ -841,7 +740,7 @@ func (c *Core) performPolicyChecks(ctx context.Context, acl *ACL, te *logical.To
 		}
 	}
 
-	ret.Allowed = true
+	c.performEntPolicyChecks(ctx, acl, te, req, inEntity, opts, ret)
 
 	return ret
 }

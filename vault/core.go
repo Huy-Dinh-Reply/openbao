@@ -73,13 +73,19 @@ const (
 	// for a highly-available deploy.
 	CoreLockPath = "core/lock"
 
-	// CoreInitLockPath is the path used to acquire a coordinating lock
-	// for a highly-available deployment which is undergoing initialization.
-	CoreInitLockPath = "core/initialize-lock"
+	// The poison pill is used as a check during certain scenarios to indicate
+	// to standby nodes that they should seal
+	poisonPillPath   = "core/poison-pill"
+	poisonPillDRPath = "core/poison-pill-dr"
 
 	// coreLeaderPrefix is the prefix used for the UUID that contains
 	// the currently elected leader.
 	coreLeaderPrefix = "core/leader/"
+
+	// coreKeyringCanaryPath is used as a canary to indicate to replicated
+	// clusters that they need to perform a rekey operation synchronously; this
+	// isn't keyring-canary to avoid ignoring it when ignoring core/keyring
+	coreKeyringCanaryPath = "core/canary-keyring"
 
 	// coreGroupPolicyApplicationPath is used to store the behaviour for
 	// how policies should be applied
@@ -88,6 +94,10 @@ const (
 	// groupPolicyApplicationModeWithinNamespaceHierarchy is a configuration option for group
 	// policy application modes, which allows only in-namespace-hierarchy policy application
 	groupPolicyApplicationModeWithinNamespaceHierarchy = "within_namespace_hierarchy"
+
+	// groupPolicyApplicationModeAny is a configuration option for group
+	// policy application modes, which allows policy application irrespective of namespaces
+	groupPolicyApplicationModeAny = "any"
 
 	indexHeaderHMACKeyPath = "core/index-header-hmac-key"
 
@@ -107,6 +117,19 @@ const (
 	ForwardSSCTokenToActive = "new_token"
 
 	WrapperTypeHsmAutoDeprecated = wrapping.WrapperType("hsm-auto")
+
+	// undoLogsAreSafeStoragePath is a storage path that we write once we know undo logs are
+	// safe, so we don't have to keep checking all the time.
+	undoLogsAreSafeStoragePath = "core/raft/undo_logs_are_safe"
+
+	ErrMlockFailedTemplate = "Failed to lock memory: %v\n\n" +
+		"This usually means that the mlock syscall is not available.\n" +
+		"Vault uses mlock to prevent memory from being swapped to\n" +
+		"disk. This requires root privileges as well as a machine\n" +
+		"that supports mlock. Please enable mlock on your system or\n" +
+		"disable Vault from using it. To disable Vault from using it,\n" +
+		"set the `disable_mlock` configuration option in your configuration\n" +
+		"file."
 )
 
 var (
@@ -145,9 +168,29 @@ var (
 	// step down of the active node, to prevent instantly regrabbing the lock.
 	// It's var not const so that tests can manipulate it.
 	manualStepDownSleepPeriod = 10 * time.Second
-)
 
-var logger = logging.NewVaultLogger(log.Trace)
+	// Functions only in the Enterprise version
+	enterprisePostUnseal         = enterprisePostUnsealImpl
+	enterprisePreSeal            = enterprisePreSealImpl
+	enterpriseSetupFilteredPaths = enterpriseSetupFilteredPathsImpl
+	enterpriseSetupQuotas        = enterpriseSetupQuotasImpl
+	enterpriseSetupAPILock       = setupAPILockImpl
+	startReplication             = startReplicationImpl
+	stopReplication              = stopReplicationImpl
+	LastWAL                      = lastWALImpl
+	LastPerformanceWAL           = lastPerformanceWALImpl
+	LastDRWAL                    = lastDRWALImpl
+	PerformanceMerkleRoot        = merkleRootImpl
+	DRMerkleRoot                 = merkleRootImpl
+	LastRemoteWAL                = lastRemoteWALImpl
+	LastRemoteUpstreamWAL        = lastRemoteUpstreamWALImpl
+	WaitUntilWALShipped          = waitUntilWALShippedImpl
+	storedLicenseCheck           = func(c *Core, conf *CoreConfig) error { return nil }
+	LicenseAutoloaded            = func(*Core) bool { return false }
+	LicenseInitCheck             = func(*Core) error { return nil }
+	LicenseSummary               = func(*Core) (*LicenseState, error) { return nil, nil }
+	LicenseReload                = func(*Core) error { return nil }
+)
 
 // NonFatalError is an error that can be returned during NewCore that should be
 // displayed but not cause a program exit
@@ -223,6 +266,8 @@ type migrationInformation struct {
 // interface for API handlers and is responsible for managing the logical and physical
 // backends, router, security barrier, and audit trails.
 type Core struct {
+	entCore
+
 	// The registry of builtin plugins is passed in here as an interface because
 	// if it's used directly, it results in import cycles.
 	builtinRegistry BuiltinRegistry
@@ -242,13 +287,16 @@ type Core struct {
 	redirectAddr string
 
 	// clusterAddr is the address we use for clustering
-	clusterAddr atomic.Value
+	clusterAddr *atomic.Value
 
 	// physical backend is the un-trusted backend with durable data
 	physical physical.Backend
 
 	// serviceRegistration is the ServiceRegistration network
 	serviceRegistration sr.ServiceRegistration
+
+	// hcpLinkStatus is a string describing the status of HCP link connection
+	hcpLinkStatus HCPLinkStatus
 
 	// underlyingPhysical will always point to the underlying backend
 	// implementation. This is an un-trusted backend with durable data
@@ -264,25 +312,26 @@ type Core struct {
 	// postUnsealStarted informs the raft retry join routine that unseal key
 	// validation is completed and post unseal has started so that it can complete
 	// the join process when Shamir seal is in use
-	postUnsealStarted atomic.Bool
+	postUnsealStarted *uint32
 
 	// raftInfo will contain information required for this node to join as a
 	// peer to an existing raft cluster. This is marked atomic to prevent data
 	// races and casted to raftInformation wherever it is used.
-	raftInfo atomic.Pointer[raftInformation]
+	raftInfo *atomic.Value
 
 	// migrationInfo is used during (and possibly after) a seal migration.
-	// This contains information about the seal we are migrating *from*. Even
+	// This contains information about the seal we are migrating *from*.  Even
 	// post seal migration, provided the old seal is still in configuration
-	// migrationInfo will be populated, which may be necessary for seal rewrap.
+	// migrationInfo will be populated, which on enterprise may be necessary for
+	// seal rewrap.
 	migrationInfo     *migrationInformation
-	sealMigrationDone atomic.Bool
+	sealMigrationDone *uint32
 
 	// barrier is the security barrier wrapping the physical backend
-	barrier barrier.SecurityBarrier
+	barrier SecurityBarrier
 
 	// router is responsible for managing the mount points for logical backends.
-	router *routing.Router
+	router *Router
 
 	// logicalBackends is the mapping of backends to use for this core
 	logicalBackends map[string]logical.Factory
@@ -295,14 +344,14 @@ type Core struct {
 
 	// stateLock protects mutable state
 	stateLock locking.RWMutex
-	sealed    atomic.Bool
+	sealed    *uint32
 
-	standby              atomic.Bool
+	standby              bool
+	perfStandby          bool
 	standbyDoneCh        chan struct{}
-	standbyStopCh        atomic.Value
-	standbyRestartCh     atomic.Value
+	standbyStopCh        *atomic.Value
 	manualStepDownCh     chan struct{}
-	keepHALockOnStepDown atomic.Bool
+	keepHALockOnStepDown *uint32
 	heldHALock           physical.Lock
 
 	// shutdownDoneCh is used to notify when core.Shutdown() completes.
@@ -315,21 +364,21 @@ type Core struct {
 	unlockInfo *unlockInformation
 
 	// generateRootProgress holds the shares until we reach enough
-	// to verify the root key
+	// to verify the master key
 	generateRootConfig   *GenerateRootConfig
 	generateRootProgress [][]byte
 	generateRootLock     sync.Mutex
 
 	// These variables holds the config and shares we have until we reach
-	// enough to verify the appropriate root key. Note that the same lock is
+	// enough to verify the appropriate master key. Note that the same lock is
 	// used; this isn't time-critical so this shouldn't be a problem.
-	rootRotationConfig     *SealConfig
-	recoveryRotationConfig *SealConfig
-	rotationLock           sync.RWMutex
+	barrierRekeyConfig  *SealConfig
+	recoveryRekeyConfig *SealConfig
+	rekeyLock           sync.RWMutex
 
 	// mounts is loaded after unseal since it is a protected
 	// configuration
-	mounts *routing.MountTable
+	mounts *MountTable
 
 	// mountsLock is used to ensure that the mounts table does not
 	// change underneath a calling function
@@ -341,7 +390,7 @@ type Core struct {
 
 	// auth is loaded after unseal since it is a protected
 	// configuration
-	auth *routing.MountTable
+	auth *MountTable
 
 	// authLock is used to ensure that the auth table does not
 	// change underneath a calling function
@@ -349,7 +398,7 @@ type Core struct {
 
 	// audit is loaded after unseal since it is a protected
 	// configuration
-	audit *routing.MountTable
+	audit *MountTable
 
 	// auditLock is used to ensure that the audit table does not
 	// change underneath a calling function
@@ -371,7 +420,7 @@ type Core struct {
 	cubbyholeBackend *CubbyholeBackend
 
 	// systemBarrierView is the barrier view for the system backend
-	systemBarrierView barrier.View
+	systemBarrierView *BarrierView
 
 	// expiration manager is used for managing LeaseIDs,
 	// renewal, expiration and revocation
