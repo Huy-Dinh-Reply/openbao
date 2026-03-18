@@ -187,24 +187,14 @@ func (fsrv *FileServer) serveBrowse(fileSystem fs.FS, root, dirPath string, w ht
 	// of "/a/b/c" - so we have to redirect in this case
 	// so that the path is "/a/" and the client constructs
 	// relative hrefs "b/c" to be "/a/b/c".
-	//
-	// Only redirect if the last element of the path (the filename) was not
-	// rewritten; if the admin wanted to rewrite to the canonical path, they
-	// would have, and we have to be very careful not to introduce unwanted
-	// redirects and especially redirect loops! (Redirecting using the
-	// original URI is necessary because that's the URI the browser knows,
-	// we don't want to redirect from internally-rewritten URIs.)
-	// See https://github.com/caddyserver/caddy/issues/4205.
-	// We also redirect if the path is empty, because this implies the path
-	// prefix was fully stripped away by a `handle_path` handler for example.
-	// See https://github.com/caddyserver/caddy/issues/4466.
-	origReq := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
-	if r.URL.Path == "" || path.Base(origReq.URL.Path) == path.Base(r.URL.Path) {
-		if !strings.HasSuffix(origReq.URL.Path, "/") {
+
+	originalRequest := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
+	if r.URL.Path == "" || path.Base(originalRequest.URL.Path) == path.Base(r.URL.Path) {
+		if !strings.HasSuffix(originalRequest.URL.Path, "/") {
 			if c := fsrv.logger.Check(zapcore.DebugLevel, "redirecting to trailing slash to preserve hrefs"); c != nil {
 				c.Write(zap.String("request_path", r.URL.Path))
 			}
-			return redirect(w, r, origReq.URL.Path+"/")
+			return redirect(w, r, originalRequest.URL.Path+"/")
 		}
 	}
 
@@ -245,17 +235,17 @@ func (fsrv *FileServer) serveBrowse(fileSystem fs.FS, root, dirPath string, w ht
 	buf.Reset()
 	defer bufPool.Put(buf)
 
-	acceptHeader := strings.ToLower(strings.Join(r.Header["Accept"], ","))
+	acptHdr := strings.ToLower(strings.Join(r.Header["Accept"], ","))
 	w.Header().Set("Last-Modified", listing.lastModified.Format(http.TimeFormat))
 
 	switch {
-	case strings.Contains(acceptHeader, "application/json"):
+	case strings.Contains(acptHdr, "application/json"):
 		if err := json.NewEncoder(buf).Encode(listing.Items); err != nil {
 			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	case strings.Contains(acceptHeader, "text/plain"):
+	case strings.Contains(acptHdr, "text/plain"):
 		writer := tabwriter.NewWriter(buf, 0, 8, 1, '\t', tabwriter.AlignRight)
 
 		// Header on top
@@ -342,16 +332,16 @@ func (fsrv *FileServer) browseApplyQueryParams(w http.ResponseWriter, r *http.Re
 
 	// The configs in Caddyfile have lower priority than Query params,
 	// so put it at first.
-	for idx, item := range fsrv.Browse.SortOptions {
+	for idx, entry := range fsrv.Browse.SortOptions {
 		// Only `sort` & `order`, 2 params are allowed
 		if idx >= 2 {
 			break
 		}
-		switch item {
+		switch entry {
 		case sortByName, sortByNameDirFirst, sortBySize, sortByTime:
-			sortParam = item
+			sortParam = entry
 		case sortOrderAsc, sortOrderDesc:
-			orderParam = item
+			orderParam = entry
 		}
 	}
 
