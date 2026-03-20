@@ -1,4 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
+// Copyright (c) 2026 OpenBao a Series of LF Projects, LLC
 // SPDX-License-Identifier: MPL-2.0
 
 package userpass
@@ -68,6 +69,15 @@ func pathUsers(b *backend) *framework.Path {
 			"password": {
 				Type:        framework.TypeString,
 				Description: "Password for this user.",
+				DisplayAttrs: &framework.DisplayAttributes{
+					Sensitive: true,
+				},
+			},
+
+			"password_hash": {
+				Type:        framework.TypeString,
+				Description: "Pre-hashed bcrypt password for this user. Mutually exclusive with password.",
+				Deprecated:  true,
 				DisplayAttrs: &framework.DisplayAttributes{
 					Sensitive: true,
 				},
@@ -251,7 +261,10 @@ func (b *backend) userCreateUpdate(ctx context.Context, req *logical.Request, d 
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
 
-	if _, ok := d.GetOk("password"); ok {
+	_, hasPassword := d.GetOk("password")
+	_, hasPasswordHash := d.GetOk("password_hash")
+
+	if hasPassword || hasPasswordHash {
 		userErr, intErr := b.updateUserPassword(req, d, userEntry)
 		if intErr != nil {
 			return nil, intErr
@@ -279,6 +292,7 @@ func (b *backend) userCreateUpdate(ctx context.Context, req *logical.Request, d 
 			return logical.ErrorResponse(err.Error()), nil
 		}
 	}
+
 	if err := b.setUser(ctx, req.Storage, username, userEntry); err != nil {
 		return nil, err
 	}
@@ -291,10 +305,12 @@ func (b *backend) userCreateUpdate(ctx context.Context, req *logical.Request, d 
 }
 
 func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	password := d.Get("password").(string)
-	if req.Operation == logical.CreateOperation && password == "" {
-		return logical.ErrorResponse("missing password"), logical.ErrInvalidRequest
+	if req.Operation == logical.CreateOperation {
+		if err := validatePasswordInput(d); err != nil {
+			return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+		}
 	}
+
 	return b.userCreateUpdate(ctx, req, d)
 }
 
